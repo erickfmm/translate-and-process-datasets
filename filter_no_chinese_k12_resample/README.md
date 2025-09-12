@@ -36,6 +36,23 @@ python filter_chinese.py
 ```
 Result: Saved dataset directory at `OUTPUT_DATASET_PATH` (e.g. `./filtered_k12_resample_no_chinese`).
 
+### CLI Options (`filter_chinese.py`)
+All parameters are configurable via flags (run `--help`).
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--dataset-name` | Source HF dataset repository | `Jakumetsu/k12-resample` |
+| `--split` | Dataset split | `train` |
+| `--yolo-model-path` | Path to YOLO weights | `yolo_chinese_m.pt` |
+| `--output-path` | Destination directory for filtered dataset | `./filtered_k12_resample_no_chinese` |
+| `--max-rows` | Limit number of rows processed (debug) | None |
+| `--progress-interval` | Rows between progress prints | 100 |
+
+Example:
+```bash
+python filter_chinese.py --dataset-name Jakumetsu/k12-resample --yolo-model-path models/yolo_chinese_m.pt --max-rows 500
+```
+
 ## 2. Export to CSV + PNG
 Update the call in `export_to_csv.py` if your output path differs.
 ```bash
@@ -44,6 +61,21 @@ python export_to_csv.py
 Creates:
 - `output/images/` (PNG files named `<row_id>_<idx>.png`)
 - `output/data.csv`
+
+### CLI Options (`export_to_csv.py`)
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--dataset-path` | Path to saved dataset (load_from_disk) | `./filtered_k12_resample_no_chinese` |
+| `--output-dir` | Output directory | `output` |
+| `--csv-name` | CSV filename | `data.csv` |
+| `--image-format` | `png` / `jpg` / `jpeg` | `png` |
+| `--limit` | Limit number of rows exported | None |
+| `--no-overwrite` | Prevent overwriting existing CSV | (off) |
+
+Example:
+```bash
+python export_to_csv.py --dataset-path ./filtered_k12_resample_no_chinese --output-dir export --image-format jpg
+```
 
 ## 3. Push to Hugging Face Hub
 Edit in `sync_dataset.py`:
@@ -58,6 +90,18 @@ huggingface-cli login
 Then:
 ```bash
 python sync_dataset.py
+```
+
+### CLI Options (`sync_dataset.py`)
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--local-path` | Local filtered dataset directory | `./filtered_k12_resample_no_chinese` |
+| `--repo-id` | Target dataset repo (required) | (none) |
+| `--private` | Create as private (public if omitted) | (off) |
+
+Example:
+```bash
+python sync_dataset.py --local-path ./filtered_k12_resample_no_chinese --repo-id yourname/k12-resample-no-chinese-filtered --private
 ```
 
 ## Notes & Tips

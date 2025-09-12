@@ -38,6 +38,23 @@ Outputs:
 - `coto1.csv` (incremental writes during processing)
 - `translated_dataset_cot.csv` (final DataFrame)
 
+### CLI Options
+Run `python translate.py --help` to view all flags.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--data-files` | One or more JSONL HF paths or local files | Two OpenO1 paths |
+| `--model` | Translation model | `Helsinki-NLP/opus-mt-en-es` |
+| `--device` | `auto`, `-1`, `cpu`, or CUDA index | `auto` |
+| `--max-samples` | Limit number of samples processed | None |
+| `--interim-file` | Interim incremental CSV | `coto1.csv` |
+| `--final-csv` | Final aggregated CSV | `translated_dataset_cot.csv` |
+
+Example (GPU 0, first 100 samples):
+```bash
+python translate.py --device 0 --max-samples 100 --final-csv subset_openo1.csv
+```
+
 ## Configuration Points
 | Setting | Location | Notes |
 |---------|----------|-------|

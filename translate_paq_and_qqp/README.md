@@ -35,6 +35,40 @@ QQP (adjust `skip_n_rows` similarly):
 python translate_qqp.py
 ```
 
+### CLI Options
+
+Both scripts expose flags (run `--help`). Shared concepts: skipping initial rows to resume, limiting rows for debugging, and customizing output/log filenames.
+
+#### `translate_paq.py`
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--skip-rows` | Skip this many initial dataset rows (resume) | 0 |
+| `--max-rows` | Limit number of rows to translate | None |
+| `--output-excel` | Output Excel file | `dataset_paq_traducido.xlsx` |
+| `--log-file` | Log file path | `log.txt` |
+| `--model` | Translation model | `Helsinki-NLP/opus-mt-en-es` |
+| `--dataset` | Source dataset name | `embedding-data/PAQ_pairs` |
+
+Example (resume at 6500, translate 500 rows):
+```bash
+python translate_paq.py --skip-rows 6500 --max-rows 500 --output-excel paq_6500_7000.xlsx
+```
+
+#### `translate_qqp.py`
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--skip-rows` | Skip this many initial rows | 0 |
+| `--max-rows` | Limit rows to translate | None |
+| `--output-excel` | Output Excel file | `dataset_qqp_traducido.xlsx` |
+| `--log-file` | Log file path | `log.txt` |
+| `--model` | Translation model | `Helsinki-NLP/opus-mt-en-es` |
+| `--dataset` | Source dataset name | `embedding-data/QQP_triplets` |
+
+Example (first 120 rows only):
+```bash
+python translate_qqp.py --max-rows 120 --output-excel qqp_first120.xlsx
+```
+
 ## Output Artifacts
 | File | Description |
 |------|-------------|

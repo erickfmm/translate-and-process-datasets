@@ -1,25 +1,23 @@
 import re
 import pandas as pd
 import torch
-from datasets import load_dataset, Dataset, concatenate_datasets
+import argparse
+from typing import List, Dict, Any, Optional
+from datasets import load_dataset, concatenate_datasets
 from transformers import pipeline
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
-import re
 
+def setup_nltk():
+    try:
+        nltk.download('punkt', quiet=True)
+    except Exception:
+        pass
 
-# Verificar disponibilidad de CUDA
-#device = 0 if torch.cuda.is_available() else -1
-device = "cpu"
-
-# Cargar los datos sin que las columnas inconsistentes causen errores
-# Primero cargamos todos los archivos JSON uno por uno
-data_files = [
+DEFAULT_DATA_FILES = [
     "hf://datasets/O1-OPEN/OpenO1-SFT/OpenO1-SFT.jsonl",
     "hf://datasets/O1-OPEN/OpenO1-SFT/OpenO1-SFT-Pro.jsonl"
 ]
-nltk.download('punkt')#, quiet=True)
-nltk.download('punkt_tab')
 
 def extract_text_between_tags(text, tag):
     """
@@ -35,22 +33,14 @@ def extract_text_between_tags(text, tag):
     pattern = fr'<{tag}>(.*?)</{tag}>'
     return re.findall(pattern, text, re.DOTALL)
 
-datasets = []
-for file in data_files:
-    # Intentar cargar con diferentes configuraciones
-    dataset = load_dataset("json", data_files=file, split="train")
-    # Detectar columnas y renombrarlas para unificación
-    if 'instruction' in dataset.column_names and 'output' in dataset.column_names:
-        dataset = dataset.rename_columns({"instruction": "prompt", "output": "response"})
-    datasets.append(dataset)
-
-# Concatenar todos los datasets procesados en uno solo
-unified_dataset = concatenate_datasets(datasets)
-
-# Cargar el modelo de traducción con soporte CUDA
-translator = pipeline("translation", model="Helsinki-NLP/opus-mt-en-es", device=device)
-
-file_salida = open("coto1.csv", "w", encoding="utf-8")
+def load_and_prepare(data_files: List[str]):
+    datasets = []
+    for file in data_files:
+        dataset = load_dataset("json", data_files=file, split="train")
+        if 'instruction' in dataset.column_names and 'output' in dataset.column_names:
+            dataset = dataset.rename_columns({"instruction": "prompt", "output": "response"})
+        datasets.append(dataset)
+    return concatenate_datasets(datasets)
 
 # Función para detectar idioma (Inglés vs Chino)
 def is_english(text):
@@ -66,7 +56,7 @@ def is_english(text):
     return bool(contains_english and not contains_chinese)
 
 # Procesar en lotes para evitar sobrecarga de memoria
-def process_batch(batch, batch_idx):
+def process_batch(batch, batch_idx, translator, file_handle=None):
     try:
         prompts = batch['prompt']
         responses = batch['response']
@@ -119,8 +109,9 @@ def process_batch(batch, batch_idx):
                 translated_batch['response_salida'].append(translated_salida)
                 translated_batch['original_prompt'].append(prompt)
                 translated_batch['original_response'].append(response)
-                file_salida.write(f'\n"{translated_prompt}","{translated_pensamiento}","{translated_salida}","{prompt}","{response}"\n')
-                file_salida.flush()
+                if file_handle:
+                    file_handle.write(f'\n"{translated_prompt}","{translated_pensamiento}","{translated_salida}","{prompt}","{response}"\n')
+                    file_handle.flush()
         except Exception as e:
             print(f"Error in {i}: {e}")
             continue
@@ -128,12 +119,47 @@ def process_batch(batch, batch_idx):
     print(f"Procesado lote {batch_idx}: {len(translated_batch['prompt'])} traducciones realizadas.")
     return translated_batch
 
-# Aplicar el procesamiento en el dataset usando `map` para procesamiento en lotes
-#processed_dataset = unified_dataset.map(lambda batch, idx: process_batch(batch, idx), batched=True, batch_size=2, with_indices=True)
-processed_dataset =process_batch(unified_dataset, 1)
-file_salida.close()
-# Guardar el resultado en un archivo CSV
-df = pd.DataFrame(processed_dataset)
-df.to_csv("translated_dataset_cot.csv", index=False, encoding='utf-8')
+def run(data_files: List[str],
+        model_name: str,
+        device: str,
+        max_samples: Optional[int],
+        interim_file: str,
+        final_csv: str) -> None:
+    setup_nltk()
+    dev = device
+    if device == 'auto':
+        dev = 0 if torch.cuda.is_available() else -1
+    translator = pipeline("translation", model=model_name, device=dev)
+    unified_dataset = load_and_prepare(data_files)
+    file_salida = open(interim_file, "w", encoding="utf-8")
+    processed_dataset = process_batch(unified_dataset if max_samples is None else unified_dataset.select(range(min(len(unified_dataset), max_samples))), 1, translator, file_handle=file_salida)
+    file_salida.close()
+    df = pd.DataFrame(processed_dataset)
+    df.to_csv(final_csv, index=False, encoding='utf-8')
+    print(f"Traducción completada y guardada en '{final_csv}'")
 
-print("Traducción completada y guardada en 'translated_dataset_cot.csv'")
+
+def build_arg_parser():
+    p = argparse.ArgumentParser(description="Translate OpenO1-SFT datasets prompts and tagged segments to Spanish.")
+    p.add_argument('--data-files', nargs='+', default=DEFAULT_DATA_FILES, help='List of JSONL HF paths or local files')
+    p.add_argument('--model', default='Helsinki-NLP/opus-mt-en-es', help='Translation model')
+    p.add_argument('--device', default='auto', help='Device: auto|-1|cpu|cuda index (e.g., 0)')
+    p.add_argument('--max-samples', type=int, default=None, help='Limit number of samples (debug)')
+    p.add_argument('--interim-file', default='coto1.csv', help='Interim write file for streaming progress')
+    p.add_argument('--final-csv', default='translated_dataset_cot.csv', help='Final aggregated CSV output')
+    return p
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    run(data_files=args.data_files,
+        model_name=args.model,
+        device=args.device,
+        max_samples=args.max_samples,
+        interim_file=args.interim_file,
+        final_csv=args.final_csv)
+
+
+if __name__ == '__main__':
+    main()

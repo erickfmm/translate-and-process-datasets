@@ -24,6 +24,23 @@ python translate.py
 ```
 Output file: `openlong_cot_es.csv` in the working directory.
 
+### CLI Options
+Run `python translate.py --help` for the full list.
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model` | Translation model name | `Helsinki-NLP/opus-mt-en-es` |
+| `--dataset` | HF dataset name | `qq8933/OpenLongCoT-Pretrain` |
+| `--split` | Dataset split | `train` |
+| `--output-csv` | Output CSV filename | `openlong_cot_es.csv` |
+| `--max-samples` | Limit number of samples (debug) | None |
+| `--progress-interval` | Rows between progress logs | 100 |
+
+Example limiting to 200 samples:
+```bash
+python translate.py --max-samples 200 --output-csv sample_openlongcot.csv
+```
+
 ## Customization
 | Need | Where to change |
 |------|-----------------|

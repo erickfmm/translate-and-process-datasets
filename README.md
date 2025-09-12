@@ -27,6 +27,12 @@ Run a script (example):
 python translate_openlongcot-pretrain/translate.py
 ```
 
+All scripts now support `--help` for CLI options, e.g.:
+```bash
+python filter_no_chinese_k12_resample/filter_chinese.py --help
+python translate_paq_and_qqp/translate_paq.py --skip-rows 5000 --max-rows 1000 --output-excel paq_partial.xlsx
+```
+
 See each subfolder for: dependencies, configuration variables, outputs, and troubleshooting tips.
 
 ## Hugging Face Usage Tips
