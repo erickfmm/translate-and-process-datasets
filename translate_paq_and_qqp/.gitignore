@@ -1,0 +1,5 @@
+venv/
+.cache/
+
+log.txt
+dataset_traducido.xlsx

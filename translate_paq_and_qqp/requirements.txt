@@ -1,0 +1,9 @@
+datasets
+transformers
+pandas
+openpyxl
+torch
+sentencepiece
+sacremoses
+hf_xet
+huggingface_hub[hf_xet]
