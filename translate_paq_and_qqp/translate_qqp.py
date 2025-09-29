@@ -22,7 +22,7 @@ def translate_triplets(skip_rows: int,
 					   model_name: str,
 					   dataset_name: str = "embedding-data/QQP_triplets") -> None:
 	configure_cache(Path.cwd())
-	pipe = pipeline("translation", model=model_name)
+	pipe = pipeline("translation", model=model_name, device="cuda")
 	dataset = load_dataset(dataset_name, streaming=False, split="train")
 	all_data = []
 	index = []
