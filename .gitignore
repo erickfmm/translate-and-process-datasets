@@ -208,3 +208,6 @@ __marimo__/
 
 # Virtual environments
 **/venv/
+
+**/qqp_translate_env/
+**/nohup.out
