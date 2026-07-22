@@ -8,8 +8,13 @@ from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Any
 from datasets import load_dataset
 from openpyxl import Workbook
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+from translation_engine import (
+	make_engine,
+	engine_config_from_args,
+	add_engine_args,
+	RetryExhaustedError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -28,37 +33,6 @@ def configure_cache(base: Path):
 	os.environ['HF_DATASETS_CACHE'] = str(base / '.cache')
 
 
-def resolve_device(device: Optional[str]) -> str:
-	if device is None:
-		return 'cuda' if torch.cuda.is_available() else 'cpu'
-	try:
-		resolved_device = str(torch.device(device))
-	except (TypeError, RuntimeError) as exc:
-		raise ValueError(
-			f"Invalid device '{device}'. Use values like 'cpu', 'cuda', or 'cuda:0'."
-		) from exc
-	if resolved_device.startswith('cuda') and not torch.cuda.is_available():
-		raise RuntimeError('CUDA device requested, but CUDA is not available in this environment.')
-	return resolved_device
-
-
-def load_translation_model(model_name: str, device: Optional[str]):
-	resolved_device = resolve_device(device)
-	tokenizer = AutoTokenizer.from_pretrained(model_name)
-	model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-	model.to(resolved_device)
-	model.eval()
-	return tokenizer, model, resolved_device
-
-
-@torch.inference_mode()
-def translate_texts(texts, tokenizer, model, device: str):
-	encoded = tokenizer(texts, return_tensors='pt', padding=True, truncation=True)
-	encoded = {key: value.to(device) for key, value in encoded.items()}
-	generated_tokens = model.generate(**encoded)
-	return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-
-
 # ---------------------------------------------------------------------------
 # Worker (slave) process
 # ---------------------------------------------------------------------------
@@ -66,18 +40,17 @@ def worker_process(
 	worker_id: int,
 	task_queue: mp.Queue,
 	result_queue: mp.Queue,
-	model_name: str,
-	device: Optional[str],
+	engine_config: Dict[str, Any],
 ):
 	"""
-	Slave worker process. Loads the translation model and waits for batches
+	Slave worker process. Loads the translation engine and waits for batches
 	from the master via *task_queue*. Each batch is a list of
 	(dataset_index, Q_original, POS_original, NEGs_original) tuples.
 	Results are sent back through *result_queue*.
 	"""
 	try:
 		configure_cache(Path.cwd())
-		tokenizer, model, resolved_device = load_translation_model(model_name, device)
+		engine = make_engine(**engine_config)
 		result_queue.put((MSG_WORKER_READY, worker_id, None))
 
 		while True:
@@ -92,15 +65,11 @@ def worker_process(
 
 			for dataset_index, Q_original, POS_original, NEGs_original in batch:
 				# Translate query and positive
-				Q_traducida, POS_traducida = translate_texts(
-					[Q_original, POS_original], tokenizer, model, resolved_device
-				)
+				Q_traducida, POS_traducida = engine.translate([Q_original, POS_original])
 				# Translate negatives one by one (variable count per row)
 				NEGs_traducidas = []
 				for neg in NEGs_original:
-					[neg_t] = translate_texts(
-						[neg], tokenizer, model, resolved_device
-					)
+					[neg_t] = engine.translate([neg])
 					NEGs_traducidas.append(neg_t)
 
 				results.append({
@@ -138,8 +107,7 @@ class MasterCoordinator:
 		self,
 		output_excel: str,
 		log_file: str,
-		model_name: str,
-		device: Optional[str],
+		engine_config: Dict[str, Any],
 		num_workers: int,
 		batch_size: int,
 		skip_rows: int,
@@ -150,8 +118,7 @@ class MasterCoordinator:
 	):
 		self.output_excel = output_excel
 		self.log_file = log_file
-		self.model_name = model_name
-		self.device = device
+		self.engine_config = engine_config
 		self.num_workers = num_workers
 		self.batch_size = batch_size
 		self.skip_rows = skip_rows
@@ -225,14 +192,14 @@ class MasterCoordinator:
 			task_queues.append(tq)
 			p = ctx.Process(
 				target=worker_process,
-				args=(wid, tq, result_queue, self.model_name, self.device),
+				args=(wid, tq, result_queue, self.engine_config),
 				name=f'worker-{wid}',
 				daemon=True,
 			)
 			workers.append(p)
 			p.start()
 
-		print(f"Started {self.num_workers} worker processes, waiting for models to load...")
+		print(f"Started {self.num_workers} worker processes, waiting for engine to load...")
 
 		# Wait for all workers to signal readiness
 		ready_workers = set()
@@ -283,8 +250,12 @@ class MasterCoordinator:
 					print(f"Worker {wid} crashed: {payload}")
 					f_log.write(f"{datetime.now()},0,-,Worker {wid} crashed: {payload}\n")
 					active_workers.discard(wid)
-					if not active_workers:
-						raise RuntimeError(f"All workers failed. Last error from worker {wid}: {payload}")
+					# Retry exhaustion is fatal -> stop the whole pipeline.
+					# Other transient worker crashes just retire the worker.
+					if isinstance(payload, RetryExhaustedError) or not active_workers:
+						raise RuntimeError(
+							f"Stopping pipeline due to worker {wid} error: {payload}"
+						)
 					continue
 
 				if msg_type == MSG_WORKER_DONE:
@@ -413,14 +384,13 @@ def translate_triplets_single(skip_rows: int,
 							  max_rows: Optional[int],
 							  output_excel: str,
 							  log_file: str,
-							  model_name: str,
-							  device: Optional[str] = None,
+							  engine_config: Dict[str, Any],
 							  flush_every: int = 5,
 							  flush_interval_seconds: float = 5.0,
 							  dataset_name: str = "embedding-data/QQP_triplets") -> None:
 	"""Single-process mode with non-blocking buffered XLSX writing."""
 	configure_cache(Path.cwd())
-	tokenizer, model, resolved_device = load_translation_model(model_name, device)
+	engine = make_engine(**engine_config)
 	dataset = load_dataset(dataset_name, streaming=False, split="train")
 
 	output_path = Path(output_excel)
@@ -477,6 +447,7 @@ def translate_triplets_single(skip_rows: int,
 
 	processed = 0
 	last_index = None
+	stop_requested = False
 	f_log = open(log_file, 'w', encoding='utf-8', buffering=1)
 	try:
 		f_log.write("time,delta,item,event\n")
@@ -492,14 +463,10 @@ def translate_triplets_single(skip_rows: int,
 				POS_original = data["set"]["pos"][0]
 				NEGs_original = data["set"]["neg"]
 				f_log.write(f"{datetime.now()},{datetime.now()-start_time},{i},A procesar\n")
-				Q_traducida, POS_traducida = translate_texts(
-					[Q_original, POS_original], tokenizer, model, resolved_device
-				)
+				Q_traducida, POS_traducida = engine.translate([Q_original, POS_original])
 				NEGs_traducidas = []
 				for neg in NEGs_original:
-					[neg_t] = translate_texts(
-						[neg], tokenizer, model, resolved_device
-					)
+					[neg_t] = engine.translate([neg])
 					NEGs_traducidas.append(neg_t)
 				d = {
 					"Q_original": Q_original,
@@ -519,6 +486,15 @@ def translate_triplets_single(skip_rows: int,
 						f"Processed {processed} rows (dataset index {i}, "
 						f"flushed {saved_rows} rows to disk)"
 					)
+			except RetryExhaustedError as e:
+				# Retries exhausted on this item: stop the pipeline cleanly.
+				f_log.write(
+					f"{datetime.now()},{datetime.now()-start_time},{i},"
+					f"RetryExhausted: {e}\n"
+				)
+				print(f"Fatal at index {i}: retries exhausted: {e}")
+				stop_requested = True
+				break
 			except Exception as e:
 				f_log.write(f"{datetime.now()},{datetime.now()-start_time},{i},Error: {e}\n")
 				print(f"Error at index {i}: {e}")
@@ -535,10 +511,13 @@ def translate_triplets_single(skip_rows: int,
 		finally:
 			f_log.write(f"{datetime.now()},0,{final_item},Terminó\n")
 			f_log.close()
+	status = "stopped" if stop_requested else "Completed"
 	print(
-		f"Completed. Translated {processed} triplets -> {output_excel} "
+		f"{status}. Translated {processed} triplets -> {output_excel} "
 		f"(flushed {saved_rows} rows to disk)"
 	)
+	if stop_requested:
+		raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +529,6 @@ def build_arg_parser():
 	p.add_argument('--max-rows', type=int, default=None, help='Limit rows to translate')
 	p.add_argument('--output-excel', default='dataset_qqp_traducido.xlsx', help='Output Excel file path')
 	p.add_argument('--log-file', default='log.txt', help='Log file path')
-	p.add_argument('--model', default='Helsinki-NLP/opus-mt-en-es', help='Translation model name')
-	p.add_argument('--device', default=None, help='Device for inference (e.g. cpu, cuda, cuda:0)')
 	p.add_argument('--flush-every', type=int, default=5,
 				   help='Queue this many translated rows before forcing an XLSX flush')
 	p.add_argument('--flush-interval-seconds', type=float, default=5.0,
@@ -561,6 +538,7 @@ def build_arg_parser():
 				   help='Number of worker processes (master-slave mode when > 1)')
 	p.add_argument('--batch-size', type=int, default=20,
 				   help='Rows per batch sent to each worker (default: 20)')
+	add_engine_args(p)
 	return p
 
 
@@ -572,6 +550,10 @@ def main():
 		parser.error("--workers must be >= 1")
 	if args.batch_size <= 0:
 		parser.error("--batch-size must be >= 1")
+	if args.nretries <= 0:
+		parser.error("--nretries must be >= 1")
+
+	engine_config = engine_config_from_args(args)
 
 	if args.workers == 1:
 		translate_triplets_single(
@@ -579,8 +561,7 @@ def main():
 			max_rows=args.max_rows,
 			output_excel=args.output_excel,
 			log_file=args.log_file,
-			model_name=args.model,
-			device=args.device,
+			engine_config=engine_config,
 			flush_every=args.flush_every,
 			flush_interval_seconds=args.flush_interval_seconds,
 			dataset_name=args.dataset,
@@ -590,8 +571,7 @@ def main():
 		coordinator = MasterCoordinator(
 			output_excel=args.output_excel,
 			log_file=args.log_file,
-			model_name=args.model,
-			device=args.device,
+			engine_config=engine_config,
 			num_workers=args.workers,
 			batch_size=args.batch_size,
 			skip_rows=args.skip_rows,

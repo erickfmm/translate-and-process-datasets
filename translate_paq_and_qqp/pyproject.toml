@@ -1,0 +1,43 @@
+[project]
+name = "translate-paq-and-qqp"
+version = "0.1.0"
+description = "Translate PAQ pairs and QQP triplets (en -> es) via HF Transformers or local Ollama"
+requires-python = ">=3.10"
+
+dependencies = [
+    "pandas",
+    "openpyxl",
+    "datasets",
+    "tqdm",
+    "ollama",
+]
+
+[project.optional-dependencies]
+# Everything needed for the in-process HuggingFace Transformers backend.
+# Ollama-only users can `uv sync` without this extra and skip the large CUDA wheels.
+transformers = [
+    "transformers",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "accelerate",
+    "sacremoses",
+    "sentencepiece",
+]
+
+[tool.uv]
+# This directory holds runnable scripts, not an installable package.
+package = false
+
+# PyTorch CUDA 12.4 wheels (compatible with CUDA 12.2+ runtimes, e.g. Tesla P40).
+# `explicit = true` means uv will only use this index for packages that explicitly
+# reference it via [tool.uv.sources] below.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+torchvision = [{ index = "pytorch-cu124" }]
+torchaudio = [{ index = "pytorch-cu124" }]
