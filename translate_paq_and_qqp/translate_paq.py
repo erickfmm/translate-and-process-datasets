@@ -2,6 +2,7 @@ import os
 import signal
 import argparse
 import multiprocessing as mp
+import queue as _queue
 import time
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +16,7 @@ from translation_engine import (
 	add_engine_args,
 	RetryExhaustedError,
 )
+from gpu_temp_guard import TempGuard
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +105,7 @@ class MasterCoordinator:
 		flush_every: int,
 		flush_interval_seconds: float,
 		dataset_name: str,
+		temp_guard: Optional[TempGuard] = None,
 	):
 		self.output_excel = output_excel
 		self.log_file = log_file
@@ -114,6 +117,7 @@ class MasterCoordinator:
 		self.flush_every = flush_every
 		self.flush_interval_seconds = flush_interval_seconds
 		self.dataset_name = dataset_name
+		self.temp_guard = temp_guard
 
 		# Results bookkeeping
 		self._results_buffer: Dict[int, Dict[str, Any]] = {}
@@ -204,6 +208,19 @@ class MasterCoordinator:
 		f_log = open(self.log_file, 'w', encoding='utf-8', buffering=1)
 		f_log.write("time,delta,item,event\n")
 
+		# Start temperature guard if present
+		if self.temp_guard is not None:
+			self.temp_guard._log = lambda m: (
+				print(m) or f_log.write(f"{datetime.now()},0,-,{m}\n")
+			)
+			self.temp_guard.start()
+			print(
+				f"TempGuard active: pause>={self.temp_guard.temp_max}C "
+				f"resume<={self.temp_guard.temp_resume}C "
+				f"stop>={self.temp_guard.temp_stop}C "
+				f"(every {self.temp_guard.check_interval}s)"
+			)
+
 		stop_requested = False
 
 		def handle_stop(signum, _frame):
@@ -227,11 +244,31 @@ class MasterCoordinator:
 				batch_idx += 1
 
 		batches_done = 0
+		kill_triggered = False
 
 		try:
 			while batches_done < total_batches and not stop_requested:
-				# Block waiting for a result from any worker
-				msg_type, wid, payload = result_queue.get()
+				# Critical temperature: hard-kill all workers and exit.
+				if (
+					self.temp_guard is not None
+					and self.temp_guard.kill_event.is_set()
+				):
+					kill_triggered = True
+					break
+
+				# Block waiting for a result from any worker. When the
+				# temperature guard is active, poll with a timeout so the
+				# master can react to kill_event even while workers are
+				# idle/paused.
+				if self.temp_guard is not None:
+					try:
+						msg_type, wid, payload = result_queue.get(
+							timeout=self.temp_guard.check_interval
+						)
+					except _queue.Empty:
+						continue
+				else:
+					msg_type, wid, payload = result_queue.get()
 
 				if msg_type == MSG_WORKER_ERROR:
 					print(f"Worker {wid} crashed: {payload}")
@@ -272,8 +309,29 @@ class MasterCoordinator:
 
 				# Send next batch to this worker if available
 				if batch_idx < total_batches and not stop_requested and wid in active_workers:
+					# Honor temperature pause: don't dispatch new work,
+					# in-flight batches finish and the GPU cools down.
+					if (
+						self.temp_guard is not None
+						and self.temp_guard.pause_event.is_set()
+					):
+						continue
 					task_queues[wid].put(batches[batch_idx])
 					batch_idx += 1
+
+			if kill_triggered:
+				# Temperature stop threshold reached: SIGKILL every worker
+				# and exit immediately without flushing.
+				f_log.write(
+					f"{datetime.now()},0,-,TempGuard STOP triggered; "
+					f"hard-killing workers\n"
+				)
+				f_log.flush()
+				for p in workers:
+					if p.is_alive():
+						p.kill()
+						p.join(timeout=3)
+				os._exit(2)
 
 			# Send stop sentinels to all active workers
 			for wid in range(self.num_workers):
@@ -314,6 +372,9 @@ class MasterCoordinator:
 				if p.is_alive():
 					p.terminate()
 					p.join(timeout=3)
+
+			if self.temp_guard is not None:
+				self.temp_guard.stop()
 
 			f_log.close()
 			for signum, handler in previous_handlers.items():
@@ -372,7 +433,8 @@ def translate_pairs_single(skip_rows: int,
 						   engine_config: Dict[str, Any],
 						   flush_every: int = 5,
 						   flush_interval_seconds: float = 5.0,
-						   dataset_name: str = "embedding-data/PAQ_pairs") -> None:
+						   dataset_name: str = "embedding-data/PAQ_pairs",
+						   temp_guard: Optional[TempGuard] = None) -> None:
 	"""Single-process mode with in-order buffered writing."""
 	configure_cache(Path.cwd())
 	engine = make_engine(**engine_config)
@@ -431,15 +493,37 @@ def translate_pairs_single(skip_rows: int,
 	processed = 0
 	last_index = None
 	stop_requested = False
+	kill_triggered = False
 	f_log = open(log_file, 'w', encoding='utf-8', buffering=1)
 	try:
 		f_log.write("time,delta,item,event\n")
+		if temp_guard is not None:
+			temp_guard._log = lambda m: (
+				print(m) or f_log.write(f"{datetime.now()},0,-,{m}\n")
+			)
+			temp_guard.start()
+			print(
+				f"TempGuard active: pause>={temp_guard.temp_max}C "
+				f"resume<={temp_guard.temp_resume}C "
+				f"stop>={temp_guard.temp_stop}C "
+				f"(every {temp_guard.check_interval}s)"
+			)
 		for i, data in enumerate(dataset):
 			last_index = i
 			if i < skip_rows:
 				continue
 			if max_rows is not None and processed >= max_rows:
 				break
+			# Temperature guard: wait while paused, abort if kill latched.
+			if temp_guard is not None:
+				while (
+					temp_guard.pause_event.is_set()
+					and not temp_guard.kill_event.is_set()
+				):
+					time.sleep(1)
+				if temp_guard.kill_event.is_set():
+					kill_triggered = True
+					break
 			start_time = datetime.now()
 			try:
 				Q_original = data["set"][0]
@@ -484,8 +568,13 @@ def translate_pairs_single(skip_rows: int,
 		else:
 			f_log.write(f"{datetime.now()},0,{final_item},XLSX sincronizado\n")
 		finally:
+			if temp_guard is not None:
+				temp_guard.stop()
 			f_log.write(f"{datetime.now()},0,{final_item},Terminó\n")
 			f_log.close()
+	if kill_triggered:
+		print("TempGuard STOP triggered; exiting (code 2).")
+		os._exit(2)
 	status = "stopped" if stop_requested else "Completed"
 	print(
 		f"{status}. Translated {processed} pairs -> {output_excel} "
@@ -508,6 +597,29 @@ def build_arg_parser():
 				   help='Number of worker processes (master-slave mode when > 1)')
 	p.add_argument('--batch-size', type=int, default=20,
 				   help='Rows per batch sent to each worker (default: 20)')
+	p.add_argument(
+		'--temp-guard-max', type=int, default=80,
+		help='Pause dispatching when GPU temp reaches this value (C). '
+		'Only active when --device is cuda (default: 80)',
+	)
+	p.add_argument(
+		'--temp-guard-resume', type=int, default=75,
+		help='Resume dispatching once GPU temp drops to this value (C). '
+		'Only active when --device is cuda (default: 75)',
+	)
+	p.add_argument(
+		'--temp-guard-stop', type=int, default=90,
+		help='Hard-kill the whole pipeline when GPU temp reaches this value (C). '
+		'Only active when --device is cuda (default: 90)',
+	)
+	p.add_argument(
+		'--temp-guard-time', type=int, default=30,
+		help='Seconds between GPU temperature checks (default: 30)',
+	)
+	p.add_argument(
+		'--temp-guard-gpu', type=int, default=0,
+		help='GPU index to monitor with nvidia-smi (default: 0)',
+	)
 	add_engine_args(p)
 	return p
 
@@ -522,8 +634,26 @@ def main():
 		parser.error("--batch-size must be >= 1")
 	if args.nretries <= 0:
 		parser.error("--nretries must be >= 1")
+	if not (args.temp_guard_resume < args.temp_guard_max < args.temp_guard_stop):
+		parser.error(
+			"--temp-guard-resume must be < --temp-guard-max must be < --temp-guard-stop"
+		)
+	if args.temp_guard_time < 1:
+		parser.error("--temp-guard-time must be >= 1")
 
 	engine_config = engine_config_from_args(args)
+
+	# Temperature guard is only available on CUDA devices.
+	device_str = (args.device or "").lower()
+	temp_guard = None
+	if device_str.startswith("cuda"):
+		temp_guard = TempGuard(
+			temp_max=args.temp_guard_max,
+			temp_resume=args.temp_guard_resume,
+			temp_stop=args.temp_guard_stop,
+			check_interval=args.temp_guard_time,
+			gpu_index=args.temp_guard_gpu,
+		)
 
 	if args.workers == 1:
 		translate_pairs_single(
@@ -535,6 +665,7 @@ def main():
 			flush_every=args.flush_every,
 			flush_interval_seconds=args.flush_interval_seconds,
 			dataset_name=args.dataset,
+			temp_guard=temp_guard,
 		)
 	else:
 		mp.freeze_support()
@@ -549,6 +680,7 @@ def main():
 			flush_every=args.flush_every,
 			flush_interval_seconds=args.flush_interval_seconds,
 			dataset_name=args.dataset,
+			temp_guard=temp_guard,
 		)
 		coordinator.run()
 
