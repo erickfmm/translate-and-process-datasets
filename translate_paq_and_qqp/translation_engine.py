@@ -69,20 +69,6 @@ class TranslationEngine:
 	def translate(self, texts: List[str]) -> List[str]:  # pragma: no cover - abstract
 		raise NotImplementedError
 
-	def offload_to_cpu(self) -> None:
-		"""Move model weights to system RAM to free GPU VRAM.
-
-		Default no-op; overridden by engines that own an in-process model.
-		"""
-		return None
-
-	def reload_to_device(self) -> None:
-		"""Move model weights back to the inference device.
-
-		Default no-op; overridden by engines that own an in-process model.
-		"""
-		return None
-
 
 class _RetryMixin:
 	"""Mixin providing ``_call_with_retry`` with exponential backoff."""
@@ -176,17 +162,6 @@ class TransformersEngine(_RetryMixin, TranslationEngine):
 
 		with self.torch.inference_mode():
 			return self._call_with_retry(_do)
-
-	def offload_to_cpu(self) -> None:
-		"""Move the model VRAM -> system RAM and release the CUDA cache so
-		nvidia-smi reports the freed memory (lets the GPU cool down)."""
-		self.model.to("cpu")
-		if self.torch.cuda.is_available():
-			self.torch.cuda.empty_cache()
-
-	def reload_to_device(self) -> None:
-		"""Move the model back to the configured inference device (GPU)."""
-		self.model.to(self.device)
 
 
 # ---------------------------------------------------------------------------

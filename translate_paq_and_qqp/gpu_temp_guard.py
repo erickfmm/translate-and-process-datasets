@@ -1,31 +1,32 @@
-"""GPU temperature guard.
+"""GPU temperature guard - supervisor approach.
 
-Polls the GPU temperature via the ``nvidia-smi`` command and exposes a
-background monitor that can pause/resume translation work and, in an
-emergency, request a hard kill of the whole pipeline.
+A CPU-side supervisor watches the GPU temperature by shelling out to
+``nvidia-smi``. It owns the lifecycle of a GPU translation subprocess:
 
-Usage::
+* when the temperature reaches ``temp_max`` it **kills** the GPU subprocess
+  (freeing all VRAM - "sin nada") so the hardware can cool down;
+* when the temperature drops back to ``temp_resume`` it **restarts** the
+  subprocess, resuming from the last row already saved to the output file;
+* if the temperature ever reaches ``temp_stop`` it kills the subprocess and
+  aborts permanently (safety net).
 
-	from gpu_temp_guard import TempGuard
-	tg = TempGuard(temp_max=80, temp_resume=75, temp_stop=90, check_interval=30)
-	tg.start()
-	if tg.pause_event.is_set():
-		# don't dispatch new work
-	if tg.kill_event.is_set():
-		# terminate everything
-	tg.stop()
+The supervisor itself runs purely on the CPU and holds no GPU memory, so it
+can keep watching while the GPU is idle.
 
-The guard is self-contained: ``read_gpu_temperature`` degrades gracefully
-(returning ``None``) whenever ``nvidia-smi`` is missing, fails, or yields
-unparseable output, so the monitor simply skips that cycle.
+Progress / resume point is read from the output XLSX's ``index`` column, so
+the worker just needs to keep flushing the file continuously (which it
+already does) and to append to an existing file instead of overwriting it.
 """
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
-import threading
+import sys
 import time
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -67,110 +68,198 @@ def read_gpu_temperature(gpu_index: int = 0) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
-# Temperature guard
+# Resume helpers (operate on the output XLSX)
 # ---------------------------------------------------------------------------
-class TempGuard:
-	"""Daemon thread that watches the GPU temperature and signals the
-	pipeline to pause/resume/kill.
+def read_last_index(xlsx_path) -> Optional[int]:
+	"""Return the highest ``index`` value stored in *xlsx_path*, or ``None``.
 
-	* ``pause_event`` is set while ``temp_max <= temp`` and only cleared
-	  once the reading drops back to ``temp_resume`` or below (hysteresis
-	  so the workload does not flap around the threshold).
-	* ``kill_event`` is latched when ``temp >= temp_stop``; the caller is
-	  expected to terminate the pipeline immediately.
+	Uses openpyxl read-only mode so it stays cheap even on very large files
+	(it only scans the first column). Returns ``None`` if the file is missing
+	or contains no data rows.
 	"""
+	path = Path(xlsx_path)
+	if not path.exists():
+		return None
+	try:
+		from openpyxl import load_workbook
+	except ImportError:
+		return None
 
-	def __init__(
-		self,
-		temp_max: int,
-		temp_resume: int,
-		temp_stop: int,
-		check_interval: int,
-		gpu_index: int = 0,
-		log_fn: Callable[[str], None] = print,
-	):
-		if not (temp_resume < temp_max < temp_stop):
-			raise ValueError(
-				f"Invalid thresholds: need resume({temp_resume}) < "
-				f"max({temp_max}) < stop({temp_stop})"
-			)
-		if check_interval < 1:
-			raise ValueError("check_interval must be >= 1 second")
+	last: Optional[int] = None
+	try:
+		wb = load_workbook(path, read_only=True)
+		ws = wb.active
+		# Column A holds the index; row 1 is the header.
+		for (value,) in ws.iter_rows(min_row=2, min_col=1, max_col=1, values_only=True):
+			if isinstance(value, (int, float)):
+				last = int(value)
+		wb.close()
+	except Exception:
+		return None
+	return last
 
-		self.temp_max = temp_max
-		self.temp_resume = temp_resume
-		self.temp_stop = temp_stop
-		self.check_interval = check_interval
-		self.gpu_index = gpu_index
-		self._log = log_fn
 
-		# Shared state
-		self.pause_event = threading.Event()
-		self.kill_event = threading.Event()
-		# offload_event mirrors pause_event: set when the GPU model should be
-		# moved VRAM -> system RAM, cleared when it can be reloaded to GPU.
-		self.offload_event = threading.Event()
+def load_or_create_workbook(xlsx_path, headers: List[str], resume_append: bool = False):
+	"""Return ``(workbook, sheet)`` for writing.
 
-		# Internal stop signal for the monitor thread
-		self._stop_thread = threading.Event()
-		self._thread: Optional[threading.Thread] = None
+	If *resume_append* is true and *xlsx_path* already exists, the existing
+	workbook is loaded so new rows are appended (preserving what was already
+	saved across supervisor restarts). Otherwise a fresh workbook is created
+	with *headers* as the first row.
+	"""
+	from openpyxl import Workbook
 
-	def start(self) -> None:
-		"""Spawn the background monitor thread (idempotent)."""
-		if self._thread is not None and self._thread.is_alive():
-			return
-		self._thread = threading.Thread(
-			target=self._run, name="TempGuard", daemon=True
-		)
-		self._thread.start()
+	path = Path(xlsx_path)
+	if resume_append and path.exists():
+		from openpyxl import load_workbook
+		wb = load_workbook(path)
+		ws = wb.active
+		return wb, ws
+	wb = Workbook()
+	ws = wb.active
+	ws.title = 'Hoja1'
+	ws.append(headers)
+	return wb, ws
 
-	def stop(self) -> None:
-		"""Signal the monitor thread to exit and wait briefly."""
-		self._stop_thread.set()
-		if self._thread is not None:
-			self._thread.join(timeout=self.check_interval + 1)
-			self._thread = None
 
-	def _run(self) -> None:
-		while not self._stop_thread.is_set():
-			temp = read_gpu_temperature(self.gpu_index)
-			if temp is None:
-				# nvidia-smi unavailable / failed: skip cycle, keep going.
-				self._stop_thread.wait(self.check_interval)
-				continue
+# ---------------------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------------------
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+	"""SIGKILL the whole process group of *proc* (the worker + its children)."""
+	if proc.poll() is not None:
+		return
+	try:
+		os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+	except (ProcessLookupError, PermissionError):
+		try:
+			proc.kill()
+		except ProcessLookupError:
+			pass
+	try:
+		proc.wait(timeout=10)
+	except subprocess.TimeoutExpired:
+		pass
 
-			# Critical threshold: latch kill and exit the thread.
-			if temp >= self.temp_stop:
-				self.kill_event.set()
-				self.pause_event.set()
-				self.offload_event.set()
-				self._log(
-					f"[TempGuard] STOP: {temp}C >= {self.temp_stop}C "
-					f"(GPU {self.gpu_index}) - killing pipeline"
+
+def run_temp_guard_supervisor(
+	*,
+	script_path: str,
+	argv: List[str],
+	output_xlsx: str,
+	initial_skip_rows: int,
+	temp_max: int,
+	temp_resume: int,
+	temp_stop: int,
+	check_interval: int,
+	gpu_index: int = 0,
+	log_fn: Callable[[str], None] = print,
+) -> int:
+	"""Run the CPU supervisor loop. Returns a process exit code.
+
+	*script_path* + *argv* is re-executed (with ``TRANSLATE_SUPERVISOR_CHILD=1``
+	and ``TRANSLATE_SKIP_ROWS=<n>`` in the environment) as the GPU worker. The
+	supervisor kills it at ``temp_max``, restarts it at ``temp_resume`` (resuming
+	from the last index found in *output_xlsx*), and aborts at ``temp_stop``.
+	"""
+	env = os.environ.copy()
+	env["TRANSLATE_SUPERVISOR_CHILD"] = "1"
+
+	def _temp() -> Optional[int]:
+		return read_gpu_temperature(gpu_index)
+
+	def _wait_below(temp_threshold: int, *, on_stop: bool) -> bool:
+		"""Block until temp <= temp_threshold. Return False if temp_stop hit."""
+		while True:
+			t = _temp()
+			if t is not None:
+				if t >= temp_stop:
+					log_fn(
+						f"[Supervisor] STOP: {t}C >= {temp_stop}C "
+						f"(GPU {gpu_index}) - aborting"
+					)
+					return False
+				if t <= temp_threshold:
+					return True
+				log_fn(
+					f"[Supervisor] cooling: {t}C (target <= {temp_threshold}C)"
 				)
-				return
+			time.sleep(check_interval)
 
-			# Pause when crossing max upward.
-			if temp >= self.temp_max:
-				if not self.pause_event.is_set():
-					self.pause_event.set()
-					self.offload_event.set()
-					self._log(
-						f"[TempGuard] PAUSE: {temp}C >= {self.temp_max}C "
-						f"(GPU {self.gpu_index})"
-					)
-			# Resume only when back below the resume threshold (hysteresis).
-			elif temp <= self.temp_resume:
-				if self.pause_event.is_set():
-					self.pause_event.clear()
-					self.offload_event.clear()
-					self._log(
-						f"[TempGuard] RESUME: {temp}C <= {self.temp_resume}C "
-						f"(GPU {self.gpu_index})"
-					)
+	while True:
+		# Don't spawn into an already-hot GPU: cool first.
+		t = _temp()
+		if t is not None and t >= temp_max:
+			log_fn(
+				f"[Supervisor] GPU already at {t}C >= {temp_max}C before start; "
+				f"cooling to {temp_resume}C"
+			)
+			if not _wait_below(temp_resume, on_stop=True):
+				return 2
 
-			# Interruptible sleep.
-			self._stop_thread.wait(self.check_interval)
+		# Compute the resume point from whatever is already saved.
+		last = read_last_index(output_xlsx)
+		skip = (last + 1) if last is not None else initial_skip_rows
+		env["TRANSLATE_SKIP_ROWS"] = str(skip)
+		cur = _temp()
+		log_fn(
+			f"[Supervisor] launching GPU worker from index {skip} "
+			f"(temp {cur if cur is not None else '?'}C)"
+		)
+
+		proc = subprocess.Popen(
+			[sys.executable, "-u", script_path, *argv],
+			env=env,
+			start_new_session=True,
+		)
+		killed_by_us = False
+		completed = False
+
+		# Monitor loop: watch temperature + worker status.
+		while True:
+			t = _temp()
+			rc = proc.poll()
+
+			if t is not None and t >= temp_stop:
+				log_fn(
+					f"[Supervisor] STOP: {t}C >= {temp_stop}C - killing worker "
+					f"and aborting"
+				)
+				_kill_process_group(proc)
+				return 2
+
+			if t is not None and t >= temp_max:
+				log_fn(
+					f"[Supervisor] PAUSE: {t}C >= {temp_max}C - killing GPU "
+					f"worker to free VRAM"
+				)
+				_kill_process_group(proc)
+				killed_by_us = True
+				break
+
+			if rc is not None:
+				if killed_by_us:
+					break
+				if rc == 0:
+					completed = True
+				else:
+					log_fn(
+						f"[Supervisor] worker exited unexpectedly (code {rc}); "
+						f"aborting"
+					)
+					return rc
+				break
+
+			time.sleep(check_interval)
+
+		if completed:
+			log_fn("[Supervisor] worker completed all rows")
+			return 0
+
+		# Worker was killed at temp_max: wait for the GPU to cool, then loop.
+		if not _wait_below(temp_resume, on_stop=True):
+			return 2
+		log_fn(f"[Supervisor] RESUME: restarting worker (temp <= {temp_resume}C)")
 
 
 # ---------------------------------------------------------------------------
@@ -180,23 +269,4 @@ if __name__ == "__main__":
 	def _now() -> str:
 		return time.strftime("%H:%M:%S")
 
-	tg = TempGuard(
-		temp_max=80,
-		temp_resume=75,
-		temp_stop=90,
-		check_interval=5,
-		log_fn=lambda m: print(f"{_now()} {m}"),
-	)
-	print(f"Starting TempGuard (gpu={tg.gpu_index}). Ctrl-C to stop.")
-	tg.start()
-	try:
-		while not tg.kill_event.is_set():
-			t = read_gpu_temperature(tg.gpu_index)
-			state = "PAUSED" if tg.pause_event.is_set() else "running"
-			print(f"{_now()} temp={t}C state={state}")
-			time.sleep(5)
-	except KeyboardInterrupt:
-		pass
-	finally:
-		tg.stop()
-		print("TempGuard stopped.")
+	print(f"{_now()} temp = {read_gpu_temperature(0)}C")
