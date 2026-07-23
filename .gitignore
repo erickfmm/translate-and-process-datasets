@@ -211,3 +211,5 @@ __marimo__/
 
 **/qqp_translate_env/
 **/nohup.out
+
+**/**.xlsx
