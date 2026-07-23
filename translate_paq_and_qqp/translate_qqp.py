@@ -43,12 +43,17 @@ def worker_process(
 	task_queue: mp.Queue,
 	result_queue: mp.Queue,
 	engine_config: Dict[str, Any],
+	offload_event: Optional[Any] = None,
 ):
 	"""
 	Slave worker process. Loads the translation engine and waits for batches
 	from the master via *task_queue*. Each batch is a list of
 	(dataset_index, Q_original, POS_original, NEGs_original) tuples.
 	Results are sent back through *result_queue*.
+
+	If *offload_event* (an ``multiprocessing.Event``) is provided, the worker
+	checks it before fetching each new task: when set, it offloads the model
+	VRAM -> system RAM and blocks until cleared, then reloads to GPU.
 	"""
 	try:
 		configure_cache(Path.cwd())
@@ -56,6 +61,22 @@ def worker_process(
 		result_queue.put((MSG_WORKER_READY, worker_id, None))
 
 		while True:
+			# Honor temperature offload: move weights to RAM while idle so
+			# the GPU can cool. Reload to GPU before doing any work.
+			if offload_event is not None and offload_event.is_set():
+				engine.offload_to_cpu()
+				# Spin until cleared; re-check the queue non-blockingly so a
+				# None sentinel (shutdown) is not missed.
+				while offload_event.is_set():
+					try:
+						task = task_queue.get(timeout=1)
+					except _queue.Empty:
+						continue
+					if task is None:
+						result_queue.put((MSG_WORKER_DONE, worker_id, None))
+						return
+				engine.reload_to_device()
+
 			task = task_queue.get()
 			if task is None:
 				# Sentinel: no more work
@@ -118,6 +139,7 @@ class MasterCoordinator:
 		flush_interval_seconds: float,
 		dataset_name: str,
 		temp_guard: Optional[TempGuard] = None,
+		offload_enabled: bool = False,
 	):
 		self.output_excel = output_excel
 		self.log_file = log_file
@@ -130,6 +152,7 @@ class MasterCoordinator:
 		self.flush_interval_seconds = flush_interval_seconds
 		self.dataset_name = dataset_name
 		self.temp_guard = temp_guard
+		self.offload_enabled = offload_enabled
 
 		# Results bookkeeping
 		self._results_buffer: Dict[int, Dict[str, Any]] = {}
@@ -189,6 +212,12 @@ class MasterCoordinator:
 		task_queues: List[mp.Queue] = []
 		result_queue: mp.Queue = ctx.Queue()
 
+		# Shared offload signal: master mirrors the TempGuard's offload_event
+		# here so worker processes can offload their model VRAM -> RAM.
+		offload_mp_event = None
+		if self.temp_guard is not None and self.offload_enabled:
+			offload_mp_event = ctx.Event()
+
 		# Start worker processes
 		workers: List[mp.Process] = []
 		for wid in range(self.num_workers):
@@ -196,7 +225,7 @@ class MasterCoordinator:
 			task_queues.append(tq)
 			p = ctx.Process(
 				target=worker_process,
-				args=(wid, tq, result_queue, self.engine_config),
+				args=(wid, tq, result_queue, self.engine_config, offload_mp_event),
 				name=f'worker-{wid}',
 				daemon=True,
 			)
@@ -227,11 +256,14 @@ class MasterCoordinator:
 				print(m) or f_log.write(f"{datetime.now()},0,-,{m}\n")
 			)
 			self.temp_guard.start()
+			offload_msg = (
+				"on (VRAM<->RAM shuffle)" if self.offload_enabled else "off (idle only)"
+			)
 			print(
 				f"TempGuard active: pause>={self.temp_guard.temp_max}C "
 				f"resume<={self.temp_guard.temp_resume}C "
 				f"stop>={self.temp_guard.temp_stop}C "
-				f"(every {self.temp_guard.check_interval}s)"
+				f"(every {self.temp_guard.check_interval}s, offload {offload_msg})"
 			)
 
 		stop_requested = False
@@ -268,6 +300,15 @@ class MasterCoordinator:
 				):
 					kill_triggered = True
 					break
+
+				# Mirror the guard's offload request into the shared
+				# multiprocessing.Event so workers move their model VRAM->RAM
+				# while the GPU is meant to cool down.
+				if offload_mp_event is not None:
+					if self.temp_guard.offload_event.is_set():
+						offload_mp_event.set()
+					else:
+						offload_mp_event.clear()
 
 				# Block waiting for a result from any worker. When the
 				# temperature guard is active, poll with a timeout so the
@@ -449,7 +490,8 @@ def translate_triplets_single(skip_rows: int,
 							  flush_every: int = 5,
 							  flush_interval_seconds: float = 5.0,
 							  dataset_name: str = "embedding-data/QQP_triplets",
-							  temp_guard: Optional[TempGuard] = None) -> None:
+							  temp_guard: Optional[TempGuard] = None,
+							  offload_enabled: bool = False) -> None:
 	"""Single-process mode with non-blocking buffered XLSX writing."""
 	configure_cache(Path.cwd())
 	engine = make_engine(**engine_config)
@@ -519,11 +561,14 @@ def translate_triplets_single(skip_rows: int,
 				print(m) or f_log.write(f"{datetime.now()},0,-,{m}\n")
 			)
 			temp_guard.start()
+			offload_msg = (
+				"on (VRAM<->RAM shuffle)" if offload_enabled else "off (idle only)"
+			)
 			print(
 				f"TempGuard active: pause>={temp_guard.temp_max}C "
 				f"resume<={temp_guard.temp_resume}C "
 				f"stop>={temp_guard.temp_stop}C "
-				f"(every {temp_guard.check_interval}s)"
+				f"(every {temp_guard.check_interval}s, offload {offload_msg})"
 			)
 		for i, data in enumerate(dataset):
 			last_index = i
@@ -533,12 +578,20 @@ def translate_triplets_single(skip_rows: int,
 				break
 			# Temperature guard: wait while paused, abort if kill latched.
 			if temp_guard is not None:
-				while (
-					temp_guard.pause_event.is_set()
-					and not temp_guard.kill_event.is_set()
-				):
-					time.sleep(1)
-				if temp_guard.kill_event.is_set():
+				if temp_guard.pause_event.is_set() and not temp_guard.kill_event.is_set():
+					if offload_enabled:
+						engine.offload_to_cpu()
+					while (
+						temp_guard.pause_event.is_set()
+						and not temp_guard.kill_event.is_set()
+					):
+						time.sleep(1)
+					if temp_guard.kill_event.is_set():
+						kill_triggered = True
+						break
+					if offload_enabled:
+						engine.reload_to_device()
+				elif temp_guard.kill_event.is_set():
 					kill_triggered = True
 					break
 			start_time = datetime.now()
@@ -650,6 +703,12 @@ def build_arg_parser():
 		'--temp-guard-gpu', type=int, default=0,
 		help='GPU index to monitor with nvidia-smi (default: 0)',
 	)
+	p.add_argument(
+		'--temp-guard-offload', action=argparse.BooleanOptionalAction, default=True,
+		help='When pausing, move the model VRAM -> system RAM and reload it on '
+		'resume (default: enabled). Use --no-temp-guard-offload to just idle '
+		'the GPU instead of shuffling memory. Only used when --device is cuda.',
+	)
 	add_engine_args(p)
 	return p
 
@@ -696,6 +755,7 @@ def main():
 			flush_interval_seconds=args.flush_interval_seconds,
 			dataset_name=args.dataset,
 			temp_guard=temp_guard,
+			offload_enabled=temp_guard is not None and args.temp_guard_offload,
 		)
 	else:
 		mp.freeze_support()
@@ -711,6 +771,7 @@ def main():
 			flush_interval_seconds=args.flush_interval_seconds,
 			dataset_name=args.dataset,
 			temp_guard=temp_guard,
+			offload_enabled=temp_guard is not None and args.temp_guard_offload,
 		)
 		coordinator.run()
 

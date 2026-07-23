@@ -107,6 +107,9 @@ class TempGuard:
 		# Shared state
 		self.pause_event = threading.Event()
 		self.kill_event = threading.Event()
+		# offload_event mirrors pause_event: set when the GPU model should be
+		# moved VRAM -> system RAM, cleared when it can be reloaded to GPU.
+		self.offload_event = threading.Event()
 
 		# Internal stop signal for the monitor thread
 		self._stop_thread = threading.Event()
@@ -140,6 +143,7 @@ class TempGuard:
 			if temp >= self.temp_stop:
 				self.kill_event.set()
 				self.pause_event.set()
+				self.offload_event.set()
 				self._log(
 					f"[TempGuard] STOP: {temp}C >= {self.temp_stop}C "
 					f"(GPU {self.gpu_index}) - killing pipeline"
@@ -150,6 +154,7 @@ class TempGuard:
 			if temp >= self.temp_max:
 				if not self.pause_event.is_set():
 					self.pause_event.set()
+					self.offload_event.set()
 					self._log(
 						f"[TempGuard] PAUSE: {temp}C >= {self.temp_max}C "
 						f"(GPU {self.gpu_index})"
@@ -158,6 +163,7 @@ class TempGuard:
 			elif temp <= self.temp_resume:
 				if self.pause_event.is_set():
 					self.pause_event.clear()
+					self.offload_event.clear()
 					self._log(
 						f"[TempGuard] RESUME: {temp}C <= {self.temp_resume}C "
 						f"(GPU {self.gpu_index})"
